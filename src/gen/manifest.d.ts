@@ -3,6 +3,7 @@
 export interface ManifestConfig {
 	index_bookmarks: boolean;
 	index_history: boolean;
+	profile_scope: string;
 	history_range: string;
 	history_skip_non_web: boolean;
 }

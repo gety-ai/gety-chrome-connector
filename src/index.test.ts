@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import {
 	bookmarkDocId,
 	type BookmarkEntry,
@@ -7,11 +7,13 @@ import {
 	buildHistoryDoc,
 	computeDeletes,
 	defaultChromeProfileDir,
+	discoverChromeProfileDirs,
 	flattenBookmarks,
 	historyCutoffWebkitMicros,
 	historyDocId,
 	historyRangeToMaxAgeDays,
 	isWebUrl,
+	normalizeProfileScope,
 	parseWebkitTimestamp,
 	sha1Hex,
 	webkitMicrosToRfc3339,
@@ -87,6 +89,44 @@ Deno.test('defaultChromeProfileDir resolves per-OS paths', () => {
 			'Default',
 		),
 	);
+});
+
+Deno.test('Chrome profiles are discovered in stable order', async () => {
+	const userDataDir = await Deno.makeTempDir({
+		prefix: 'gety-chrome-profiles-',
+	});
+	try {
+		for (
+			const name of [
+				'Default',
+				'Profile 2',
+				'Profile 10',
+				'Profile 1',
+				'Guest Profile',
+				'System Profile',
+			]
+		) {
+			await Deno.mkdir(join(userDataDir, name));
+		}
+
+		assert.deepEqual(
+			discoverChromeProfileDirs(userDataDir, 'all').map((path) =>
+				basename(path)
+			),
+			['Default', 'Profile 1', 'Profile 2', 'Profile 10'],
+		);
+		assert.deepEqual(
+			discoverChromeProfileDirs(userDataDir, 'default').map((path) =>
+				basename(path)
+			),
+			['Default'],
+		);
+		assert.equal(normalizeProfileScope('default'), 'default');
+		assert.equal(normalizeProfileScope('all'), 'all');
+		assert.equal(normalizeProfileScope('unexpected'), 'all');
+	} finally {
+		await Deno.remove(userDataDir, { recursive: true });
+	}
 });
 
 Deno.test('historyRangeToMaxAgeDays maps ranges', () => {
@@ -180,7 +220,22 @@ Deno.test('buildBookmarkDoc emits a linkable web doc', () => {
 	assert.equal(meta.url, 'https://example.com/');
 	assert.equal(meta.folder, 'Bookmarks bar / design');
 	assert.equal(meta.created_at, '1970-01-01T00:00:00.000Z');
+	assert.equal(meta.profile, 'Default');
 	assert.equal((doc.content ?? '').split('\n')[0], 'Example');
+});
+
+Deno.test('profile-specific bookmark docs are isolated and labeled', () => {
+	const doc = buildBookmarkDoc({
+		guid: 'same-guid',
+		name: 'Example',
+		url: 'https://example.com/',
+		folder: '',
+		dateAdded: null,
+		dateModified: null,
+	}, 'Profile 1');
+	assert.equal(doc.id, 'chrome:profile:Profile_1:bookmark:same-guid');
+	assert.match(doc.content ?? '', /Profile: Profile 1/);
+	assert.equal((doc.metadata as Record<string, unknown>).profile, 'Profile 1');
 });
 
 Deno.test('buildBookmarkDoc omits url metadata for non-web bookmarks', () => {
@@ -210,6 +265,20 @@ Deno.test('buildHistoryDoc hashes the url into a stable id', () => {
 	const meta = doc.metadata as Record<string, unknown>;
 	assert.equal(meta.url, 'https://example.com/page');
 	assert.equal(meta.visit_count, 7);
+	assert.equal(meta.profile, 'Default');
+});
+
+Deno.test('profile-specific history docs use a separate stable id', () => {
+	const url = 'https://example.com/page';
+	const doc = buildHistoryDoc({
+		url,
+		title: 'A Page',
+		visitCount: 7,
+		lastVisit: WEBKIT_UNIX_EPOCH,
+	}, 'Profile 1');
+	assert.equal(doc.id, `chrome:profile:Profile_1:history:${sha1Hex(url)}`);
+	assert.match(doc.content ?? '', /Profile: Profile 1/);
+	assert.equal((doc.metadata as Record<string, unknown>).profile, 'Profile 1');
 });
 
 Deno.test('buildHistoryDoc falls back to url when title is blank', () => {

@@ -10,7 +10,7 @@
 		"check": "deno task generate && deno check src/index.ts scripts/build.ts scripts/setup.ts scripts/generate-manifest-config.ts dev/gety-connector-sdk/mod.ts dev/runner.ts src/gen/manifest.d.ts",
 		"generate": "deno run -A scripts/generate-manifest-config.ts",
 		"setup": "deno run -A scripts/setup.ts",
-		"test": "deno test src",
+		"test": "deno test --allow-read --allow-write src",
 		"runner": "deno task build && deno run -A --env-file=.env dev/runner.ts",
 		"fix": "deno task fmt && deno task lint:fix",
 		"fmt": "deno fmt",
