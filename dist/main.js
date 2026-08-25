@@ -8,10 +8,11 @@ import {
   copyFileSync,
   existsSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync
 } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { homedir, platform, tmpdir } from "node:os";
 import process from "node:process";
 import { createHash } from "node:crypto";
@@ -60,6 +61,28 @@ function defaultChromeProfileDir(os, home, localAppData) {
       return join(home, ".config", "google-chrome", "Default");
   }
 }
+function defaultChromeUserDataDir(os, home, localAppData) {
+  return join(defaultChromeProfileDir(os, home, localAppData), "..");
+}
+function normalizeProfileScope(value) {
+  return value === "default" ? "default" : "all";
+}
+function discoverChromeProfileDirs(userDataDir, scope) {
+  if (scope === "default") {
+    const defaultDir = join(userDataDir, "Default");
+    return existsSync(defaultDir) ? [defaultDir] : [];
+  }
+  const entries = readdirSync(userDataDir, { withFileTypes: true });
+  const names = entries.filter(
+    (entry) => entry.isDirectory() && (entry.name === "Default" || /^Profile \d+$/.test(entry.name))
+  ).map((entry) => entry.name);
+  names.sort((left, right) => {
+    if (left === "Default") return -1;
+    if (right === "Default") return 1;
+    return Number(left.slice("Profile ".length)) - Number(right.slice("Profile ".length));
+  });
+  return names.map((name) => join(userDataDir, name));
+}
 function historyRangeToMaxAgeDays(range) {
   switch (range) {
     case "7d":
@@ -85,11 +108,18 @@ function historyCutoffWebkitMicros(maxAgeDays, nowMs) {
 function sha1Hex(value) {
   return createHash("sha1").update(value).digest("hex");
 }
-function bookmarkDocId(guid) {
-  return `chrome:bookmark:${guid}`;
+function profileIdPrefix(profileKey) {
+  if (profileKey === "Default") return "";
+  const safeKey = profileKey.replace(/[^0-9A-Za-z._-]+/g, "_");
+  return `chrome:profile:${safeKey}:`;
 }
-function historyDocId(url) {
-  return `chrome:history:${sha1Hex(url)}`;
+function bookmarkDocId(guid, profileKey = "Default") {
+  const prefix = profileIdPrefix(profileKey);
+  return prefix ? `${prefix}bookmark:${guid}` : `chrome:bookmark:${guid}`;
+}
+function historyDocId(url, profileKey = "Default") {
+  const prefix = profileIdPrefix(profileKey);
+  return prefix ? `${prefix}history:${sha1Hex(url)}` : `chrome:history:${sha1Hex(url)}`;
 }
 var ROOT_LABELS = {
   bookmark_bar: "Bookmarks bar",
@@ -134,7 +164,7 @@ function walkBookmarkNode(node, trail, out) {
     for (const child of children) walkBookmarkNode(child, nextTrail, out);
   }
 }
-function buildBookmarkDoc(entry) {
+function buildBookmarkDoc(entry, profileKey = "Default") {
   const title = entry.name || entry.url || "Untitled bookmark";
   const createdAt = entry.dateAdded ? webkitMicrosToRfc3339(entry.dateAdded) : null;
   const updatedAt = webkitMicrosToRfc3339(
@@ -142,15 +172,17 @@ function buildBookmarkDoc(entry) {
   );
   const lines = [title, ""];
   if (entry.url) lines.push(entry.url, "");
+  lines.push(`Profile: ${profileKey}`);
   if (entry.folder) lines.push(`Folder: ${entry.folder}`);
   if (createdAt) lines.push(`Added: ${createdAt}`);
   const content = lines.join("\n");
   const metadata = {};
   if (isWebUrl(entry.url)) metadata.url = entry.url;
+  metadata.profile = profileKey;
   if (entry.folder) metadata.folder = entry.folder;
   if (createdAt) metadata.created_at = createdAt;
   const doc = {
-    id: bookmarkDocId(entry.guid),
+    id: bookmarkDocId(entry.guid, profileKey),
     title,
     content,
     content_format: "plaintext",
@@ -161,16 +193,26 @@ function buildBookmarkDoc(entry) {
   if (updatedAt) doc.doc_updated_at = updatedAt;
   return doc;
 }
-function buildHistoryDoc(row) {
+function buildHistoryDoc(row, profileKey = "Default") {
   const title = row.title.trim() ? row.title.trim() : row.url;
   const lastVisited = webkitMicrosToRfc3339(row.lastVisit);
-  const lines = [title, "", row.url, "", `Visits: ${row.visitCount}`];
+  const lines = [
+    title,
+    "",
+    row.url,
+    "",
+    `Profile: ${profileKey}`,
+    `Visits: ${row.visitCount}`
+  ];
   if (lastVisited) lines.push(`Last visited: ${lastVisited}`);
   const content = lines.join("\n");
-  const metadata = { visit_count: row.visitCount };
+  const metadata = {
+    profile: profileKey,
+    visit_count: row.visitCount
+  };
   if (isWebUrl(row.url)) metadata.url = row.url;
   const doc = {
-    id: historyDocId(row.url),
+    id: historyDocId(row.url, profileKey),
     title,
     content,
     content_format: "plaintext",
@@ -189,9 +231,31 @@ function computeDeletes(previousIds, currentIds) {
   }
   return deletes;
 }
+function previousProfileState(prev, profileKey) {
+  const saved = prev.profiles?.[profileKey];
+  if (saved != null) return { ...saved };
+  if (profileKey === "Default") {
+    return {
+      history_cursor: prev.history_cursor,
+      history_ids: prev.history_ids,
+      bookmark_ids: prev.bookmark_ids
+    };
+  }
+  return {};
+}
+function previousProfiles(prev) {
+  const profiles = {};
+  for (const [key, profile] of Object.entries(prev.profiles ?? {})) {
+    profiles[key] = { ...profile };
+  }
+  if (prev.profiles == null && (prev.history_cursor != null || prev.history_ids != null || prev.bookmark_ids != null)) {
+    profiles.Default = previousProfileState(prev, "Default");
+  }
+  return profiles;
+}
 var ChromeConnector = class extends Connector {
   async *poll() {
-    const profileDir = defaultChromeProfileDir(
+    const userDataDir = defaultChromeUserDataDir(
       platform(),
       homedir(),
       process.env.LOCALAPPDATA
@@ -200,72 +264,109 @@ var ChromeConnector = class extends Connector {
     const indexHistory = this.config.index_history !== false;
     const range = String(this.config.history_range ?? "90d");
     const skipNonWeb = this.config.history_skip_non_web !== false;
+    const profileScope = normalizeProfileScope(
+      String(this.config.profile_scope ?? "all")
+    );
     const prev = this.lastState ?? {};
-    const state = {
-      history_cursor: prev.history_cursor,
-      history_ids: prev.history_ids,
-      bookmark_ids: prev.bookmark_ids
-    };
-    const currentBookmarkIds = /* @__PURE__ */ new Set();
-    let bookmarksScanned = false;
-    if (indexBookmarks) {
-      const bookmarksPath = join(profileDir, "Bookmarks");
-      if (existsSync(bookmarksPath)) {
-        bookmarksScanned = true;
-        const parsed = JSON.parse(readFileSync(bookmarksPath, "utf8"));
-        const updates = [];
-        for (const entry of flattenBookmarks(parsed)) {
-          const doc = buildBookmarkDoc(entry);
-          if (currentBookmarkIds.has(doc.id)) continue;
-          currentBookmarkIds.add(doc.id);
-          updates.push(upsert(doc));
-        }
-        if (updates.length > 0) {
-          yield { updates, state };
-        }
-      }
+    if (!existsSync(userDataDir)) {
+      yield { updates: [], state: prev };
+      return;
     }
-    const currentHistoryIds = /* @__PURE__ */ new Set();
-    let historyScanned = false;
-    if (indexHistory) {
-      const historyPath = join(profileDir, "History");
-      if (existsSync(historyPath)) {
-        historyScanned = true;
-        for await (const batch of this.scanHistory(historyPath, range, skipNonWeb, prev)) {
-          if (batch.cursor != null) state.history_cursor = batch.cursor;
-          for (const id of batch.ids) currentHistoryIds.add(id);
-          if (batch.updates.length > 0) {
-            yield { updates: batch.updates, state };
+    const profiles = discoverChromeProfileDirs(userDataDir, profileScope);
+    const previous = previousProfiles(prev);
+    const stateProfiles = {};
+    for (const [key, profile] of Object.entries(previous)) {
+      stateProfiles[key] = { ...profile };
+    }
+    const state = { profiles: stateProfiles };
+    const currentProfileKeys = /* @__PURE__ */ new Set();
+    const deletes = [];
+    for (const profileDir of profiles) {
+      const profileKey = basename(profileDir);
+      currentProfileKeys.add(profileKey);
+      const prevProfile = previousProfileState(prev, profileKey);
+      const profileState = { ...prevProfile };
+      stateProfiles[profileKey] = profileState;
+      const currentBookmarkIds = /* @__PURE__ */ new Set();
+      let bookmarksScanned = false;
+      if (indexBookmarks) {
+        const bookmarksPath = join(profileDir, "Bookmarks");
+        if (existsSync(bookmarksPath)) {
+          bookmarksScanned = true;
+          const parsed = JSON.parse(readFileSync(bookmarksPath, "utf8"));
+          const updates = [];
+          for (const entry of flattenBookmarks(parsed)) {
+            const doc = buildBookmarkDoc(entry, profileKey);
+            if (currentBookmarkIds.has(doc.id)) continue;
+            currentBookmarkIds.add(doc.id);
+            updates.push(upsert(doc));
+          }
+          if (updates.length > 0) {
+            yield { updates, state };
           }
         }
       }
-    }
-    const deletes = [];
-    if (!indexBookmarks) {
-      for (const id of prev.bookmark_ids ?? []) deletes.push(del(id));
-      state.bookmark_ids = [];
-    } else if (bookmarksScanned) {
-      for (const id of computeDeletes(prev.bookmark_ids, currentBookmarkIds)) {
-        deletes.push(del(id));
+      const currentHistoryIds = /* @__PURE__ */ new Set();
+      let historyScanned = false;
+      if (indexHistory) {
+        const historyPath = join(profileDir, "History");
+        if (existsSync(historyPath)) {
+          historyScanned = true;
+          for await (const batch of this.scanHistory(
+            historyPath,
+            range,
+            skipNonWeb,
+            prevProfile,
+            profileKey
+          )) {
+            if (batch.cursor != null) {
+              profileState.history_cursor = batch.cursor;
+            }
+            for (const id of batch.ids) currentHistoryIds.add(id);
+            if (batch.updates.length > 0) {
+              yield { updates: batch.updates, state };
+            }
+          }
+        }
       }
-      state.bookmark_ids = [...currentBookmarkIds];
-    } else {
-      state.bookmark_ids = prev.bookmark_ids;
-    }
-    if (!indexHistory) {
-      for (const id of prev.history_ids ?? []) deletes.push(del(id));
-      state.history_ids = [];
-    } else if (historyScanned) {
-      for (const id of computeDeletes(prev.history_ids, currentHistoryIds)) {
-        deletes.push(del(id));
+      if (!indexBookmarks) {
+        for (const id of prevProfile.bookmark_ids ?? []) deletes.push(del(id));
+        profileState.bookmark_ids = [];
+      } else if (bookmarksScanned) {
+        for (const id of computeDeletes(
+          prevProfile.bookmark_ids,
+          currentBookmarkIds
+        )) {
+          deletes.push(del(id));
+        }
+        profileState.bookmark_ids = [...currentBookmarkIds];
+      } else {
+        profileState.bookmark_ids = prevProfile.bookmark_ids;
       }
-      state.history_ids = [...currentHistoryIds];
-    } else {
-      state.history_ids = prev.history_ids;
+      if (!indexHistory) {
+        for (const id of prevProfile.history_ids ?? []) deletes.push(del(id));
+        profileState.history_ids = [];
+      } else if (historyScanned) {
+        for (const id of computeDeletes(
+          prevProfile.history_ids,
+          currentHistoryIds
+        )) {
+          deletes.push(del(id));
+        }
+        profileState.history_ids = [...currentHistoryIds];
+      } else {
+        profileState.history_ids = prevProfile.history_ids;
+      }
+    }
+    for (const [profileKey, profile] of Object.entries(previous)) {
+      if (currentProfileKeys.has(profileKey)) continue;
+      for (const id of profile.bookmark_ids ?? []) deletes.push(del(id));
+      for (const id of profile.history_ids ?? []) deletes.push(del(id));
+      delete stateProfiles[profileKey];
     }
     yield { updates: deletes, state };
   }
-  async *scanHistory(historyPath, range, skipNonWeb, prev) {
+  async *scanHistory(historyPath, range, skipNonWeb, prev, profileKey) {
     const cutoff = historyCutoffWebkitMicros(
       historyRangeToMaxAgeDays(range),
       Date.now()
@@ -309,7 +410,7 @@ var ChromeConnector = class extends Connector {
             title: typeof r.title === "string" ? r.title : "",
             visitCount: Number(r.visit_count ?? 0),
             lastVisit
-          });
+          }, profileKey);
           ids.push(doc.id);
           if (lastVisit > maxCursor) maxCursor = lastVisit;
           if (prevCursor == null || lastVisit >= prevCursor) {
@@ -344,11 +445,14 @@ export {
   computeDeletes,
   ChromeConnector as default,
   defaultChromeProfileDir,
+  defaultChromeUserDataDir,
+  discoverChromeProfileDirs,
   flattenBookmarks,
   historyCutoffWebkitMicros,
   historyDocId,
   historyRangeToMaxAgeDays,
   isWebUrl,
+  normalizeProfileScope,
   parseWebkitTimestamp,
   sha1Hex,
   webkitMicrosToRfc3339

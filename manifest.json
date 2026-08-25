@@ -5,7 +5,7 @@
 	"min_gety_app_version": "0.5.1",
 	"entry": "dist/main.js",
 	"icon": "icon.png",
-	"description": "Indexes Google Chrome bookmarks and browsing history from a local Chrome profile.",
+	"description": "Indexes Google Chrome bookmarks and browsing history from local Chrome profiles.",
 	"author": {
 		"name": "yuche"
 	},
@@ -43,6 +43,24 @@
 				"required": false,
 				"default_value": true,
 				"description": "Index visited pages from the History database."
+			},
+			{
+				"id": "profile_scope",
+				"title": "Chrome profile scope",
+				"type": "dropdown",
+				"required": false,
+				"default_value": "all",
+				"description": "Choose whether to index only Default or all Chrome profiles.",
+				"options": [
+					{
+						"value": "default",
+						"label": "Default profile only"
+					},
+					{
+						"value": "all",
+						"label": "All profiles"
+					}
+				]
 			},
 			{
 				"id": "history_range",
