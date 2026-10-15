@@ -1,0 +1,11 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    uses: gety-ai/gety-sample-connector/.github/workflows/release.yml@ci/release-workflow
+    permissions:
+      contents: write
